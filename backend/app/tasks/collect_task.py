@@ -1,7 +1,13 @@
 """
 数据采集任务
-采集流程: MES导出 → Excel解析 → 入库
-支持并发采集，提升处理效率
+采集流程: 一个页面 → 一次设置（厂区/日期/时间）→ 逐专案查询导出 → Excel解析 → 入库
+
+逻辑：
+  ① 打开浏览器页面，登录 MES
+  ② 导航到 MFG Daily → 设置厂区/日期/时间范围（只做一次）
+  ③ 依次循环每个专案：
+      设置专案名称 → 点击查询 → 检查数据 → 导出 Excel
+      → 解析 Excel → 写入数据库（先删后插）→ 清理临时文件
 """
 import os
 import asyncio
@@ -13,7 +19,8 @@ from app.models.project import ProjectConfig
 from app.models.station import StationSummary
 from app.models.task_log import TaskLog
 from app.services.mes.exporter import (
-    export_daily_report_with_retry,
+    setup_mfg_daily_page,
+    query_and_export_project,
     NoDataFoundError,
 )
 from app.services.mes.session_manager import create_fresh_page
@@ -22,108 +29,44 @@ from app.core.logging import setup_logging
 
 logger = setup_logging()
 
-# 最大并发采集数（每个并发会启动独立浏览器页面）
-MAX_CONCURRENT = 3
 
-
-async def _collect_single_project(
-    proj: ProjectConfig,
+# ─── 数据库写入（带死锁重试）─────────────────────────────────
+async def _save_to_db(
+    project_name: str,
     report_date: date,
     shift: str,
-    semaphore: asyncio.Semaphore,
-) -> dict:
-    """
-    采集单个专案（在信号量控制下并发执行）
-    返回: {"status": "success"|"no_data"|"error", "name": str, "detail": str, "count": int}
-    """
-    async with semaphore:
-        page = None
+    records: list,
+) -> None:
+    """先删除同专案+同日+同班次旧数据，再批量插入新数据"""
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            logger.info(f"开始采集专案: {proj.project_name}")
-
-            # 每个并发任务创建独立页面
-            page = await create_fresh_page()
-
-            # 1. 导出 Excel（带重试）
-            filepath = await export_daily_report_with_retry(
-                proj.project_name, report_date, shift, page=page
-            )
-
-            # 2. 解析
-            records = await excel_to_station_records(
-                filepath, proj.project_name, report_date
-            )
-
-            # 3. 写入数据库（先删除当天同班次旧数据，再插入，带死锁重试）
-            max_db_retries = 3
-            for db_attempt in range(max_db_retries):
-                try:
-                    async with AsyncSessionLocal() as db:
-                        await db.execute(
-                            delete(StationSummary).where(
-                                StationSummary.project == proj.project_name,
-                                StationSummary.report_date == report_date,
-                                StationSummary.shift == shift,
-                            )
-                        )
-                        db.add_all(records)
-                        await db.commit()
-                    break
-                except Exception as db_err:
-                    if "1213" in str(db_err) and db_attempt < max_db_retries - 1:
-                        logger.warning(
-                            f"数据库死锁 [{proj.project_name}]，第 {db_attempt+1} 次重试..."
-                        )
-                        await asyncio.sleep(1 + db_attempt * 0.5)
-                    else:
-                        raise
-
-            # 4. 清理临时文件
-            if os.path.exists(filepath):
-                os.remove(filepath)
-
-            logger.info(
-                f"专案 [{proj.project_name}] 采集完成，{len(records)} 条记录"
-            )
-            return {
-                "status": "success",
-                "name": proj.project_name,
-                "detail": f"{len(records)} 条记录",
-                "count": len(records),
-            }
-
-        except NoDataFoundError as e:
-            logger.warning(f"专案 [{proj.project_name}] 无生产数据，跳过")
-            return {
-                "status": "no_data",
-                "name": proj.project_name,
-                "detail": str(e),
-                "count": 0,
-            }
-
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    delete(StationSummary).where(
+                        StationSummary.project == project_name,
+                        StationSummary.report_date == report_date,
+                        StationSummary.shift == shift,
+                    )
+                )
+                db.add_all(records)
+                await db.commit()
+            return
         except Exception as e:
-            error_msg = f"[{proj.project_name}] 失败: {e}"
-            logger.error(error_msg)
-            return {
-                "status": "error",
-                "name": proj.project_name,
-                "detail": error_msg,
-                "count": 0,
-            }
-
-        finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+            if "1213" in str(e) and attempt < max_retries - 1:
+                logger.warning(
+                    f"数据库死锁 [{project_name}]，第 {attempt+1} 次重试..."
+                )
+                await asyncio.sleep(1 + attempt * 0.5)
+            else:
+                raise
 
 
+# ─── 主采集流程 ─────────────────────────────────────────────
 async def run_collect(report_date: date = None, shift: str = "summary"):
     """
-    主采集任务（并发版本）
-    - 遍历所有启用的专案
-    - 使用信号量控制并发数，每个专案独立导出 Excel → 解析 → 写入数据库
+    串行采集所有启用专案：
+      一个页面 → 一次初始化 → 逐专案查询导出 → 解析 → 入库
     """
     if report_date is None:
         report_date = date.today()
@@ -132,6 +75,7 @@ async def run_collect(report_date: date = None, shift: str = "summary"):
     task_name = f"collect_{shift}"
     log_id = await _start_log(task_name, shift=shift)
 
+    # 获取所有启用专案
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(ProjectConfig)
@@ -145,15 +89,88 @@ async def run_collect(report_date: date = None, shift: str = "summary"):
         await _finish_log(log_id, "WARN", "没有启用的专案", 0, 0)
         return
 
-    # 并发采集所有专案
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    tasks = [
-        _collect_single_project(proj, report_date, shift, semaphore)
-        for proj in projects
-    ]
-    results = await asyncio.gather(*tasks)
+    total = len(projects)
+    logger.info(f"共 {total} 个启用专案，开始串行采集")
 
-    # 统计结果
+    page = None
+    results = []
+
+    try:
+        # ① 创建页面并登录
+        page = await create_fresh_page()
+
+        # ② 初始化 MFG Daily 页面（导航 + 厂区 + 日期 + 时间，只做一次）
+        await setup_mfg_daily_page(page, report_date, shift)
+
+        # ③ 逐专案采集
+        for i, proj in enumerate(projects, 1):
+            proj_name = proj.project_name
+            logger.info(f"[{i}/{total}] 开始采集专案: {proj_name}")
+
+            try:
+                # 查询并导出 Excel
+                filepath = await query_and_export_project(
+                    page, proj_name, report_date, shift
+                )
+
+                # 解析 Excel → ORM 对象
+                records = await excel_to_station_records(
+                    filepath, proj_name, report_date
+                )
+
+                # 写入数据库
+                await _save_to_db(proj_name, report_date, shift, records)
+
+                # 清理临时文件
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+
+                logger.info(
+                    f"[{i}/{total}] 专案 [{proj_name}] 采集完成，{len(records)} 条记录"
+                )
+                results.append({
+                    "status": "success",
+                    "name": proj_name,
+                    "detail": f"{len(records)} 条记录",
+                    "count": len(records),
+                })
+
+            except NoDataFoundError as e:
+                logger.warning(f"[{i}/{total}] 专案 [{proj_name}] 无生产数据，跳过")
+                results.append({
+                    "status": "no_data",
+                    "name": proj_name,
+                    "detail": str(e),
+                    "count": 0,
+                })
+
+            except Exception as e:
+                error_msg = f"[{proj_name}] 失败: {e}"
+                logger.error(f"[{i}/{total}] {error_msg}")
+                results.append({
+                    "status": "error",
+                    "name": proj_name,
+                    "detail": error_msg,
+                    "count": 0,
+                })
+
+    except Exception as e:
+        logger.error(f"采集任务异常中断: {e}")
+        results.append({
+            "status": "error",
+            "name": "SYSTEM",
+            "detail": f"任务中断: {e}",
+            "count": 0,
+        })
+
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    # ─── 统计并记录日志 ─────────────────────────────────────
     success_count = 0
     no_data_count = 0
     error_msgs = []
@@ -168,8 +185,6 @@ async def run_collect(report_date: date = None, shift: str = "summary"):
 
     duration = int(time.time() - start_time)
 
-    # 构建状态和消息
-    total = len(projects)
     if error_msgs:
         status = "ERROR" if success_count == 0 else "WARN"
     else:
