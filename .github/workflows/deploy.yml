@@ -10,12 +10,14 @@ env:
   BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/mes-backend
   FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/mes-frontend
 
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
 jobs:
   backend:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -40,9 +42,6 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
