@@ -173,7 +173,7 @@ async def export_daily_report(
 
                 console.log("没有发现无数据提示，认为有数据");
                 return true;
-            }
+            })()
         ''')
 
         if not has_data:

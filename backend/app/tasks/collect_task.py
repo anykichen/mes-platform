@@ -54,17 +54,29 @@ async def _collect_single_project(
                 filepath, proj.project_name, report_date
             )
 
-            # 3. 写入数据库（先删除当天同班次旧数据，再插入）
-            async with AsyncSessionLocal() as db:
-                await db.execute(
-                    delete(StationSummary).where(
-                        StationSummary.project == proj.project_name,
-                        StationSummary.report_date == report_date,
-                        StationSummary.shift == shift,
-                    )
-                )
-                db.add_all(records)
-                await db.commit()
+            # 3. 写入数据库（先删除当天同班次旧数据，再插入，带死锁重试）
+            max_db_retries = 3
+            for db_attempt in range(max_db_retries):
+                try:
+                    async with AsyncSessionLocal() as db:
+                        await db.execute(
+                            delete(StationSummary).where(
+                                StationSummary.project == proj.project_name,
+                                StationSummary.report_date == report_date,
+                                StationSummary.shift == shift,
+                            )
+                        )
+                        db.add_all(records)
+                        await db.commit()
+                    break
+                except Exception as db_err:
+                    if "1213" in str(db_err) and db_attempt < max_db_retries - 1:
+                        logger.warning(
+                            f"数据库死锁 [{proj.project_name}]，第 {db_attempt+1} 次重试..."
+                        )
+                        await asyncio.sleep(1 + db_attempt * 0.5)
+                    else:
+                        raise
 
             # 4. 清理临时文件
             if os.path.exists(filepath):
