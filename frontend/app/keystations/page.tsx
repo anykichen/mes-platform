@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, Suspense } from 'react'
 import useSWR, { mutate } from 'swr'
 import { useSearchParams } from 'next/navigation'
 import { api } from '@/lib/api'
@@ -8,17 +8,15 @@ import { Toggle } from '@/components/common/Toggle'
 import { KeyStation } from '@/types'
 import { Plus, Trash2 } from 'lucide-react'
 
-export default function KeyStationsPage() {
+function KeyStationsContent() {
   const params = useSearchParams()
   const [project, setProject] = useState('')
   const [newStation, setNewStation] = useState('')
   const [adding, setAdding] = useState(false)
-  
-  // 获取专案列表
+
   const { data: projectsData } = useSWR('projects', api.projects.list)
   const projects = (projectsData as any[])?.map((p: any) => p.project_name) ?? []
-  
-  // 默认选择第一个专案或URL参数中的专案
+
   useEffect(() => {
     const paramProject = params.get('project')
     if (paramProject && projects.includes(paramProject)) {
@@ -120,5 +118,13 @@ export default function KeyStationsPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+export default function KeyStationsPage() {
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <KeyStationsContent />
+    </Suspense>
   )
 }
