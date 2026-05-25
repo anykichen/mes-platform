@@ -1,0 +1,38 @@
+services:
+  mes-backend:
+    image: mes-backend:latest
+    container_name: mes-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=mysql+aiomysql://mes_user:mes_secure_password_2024@exam_mysql:3306/mes_platform
+      - DATABASE_URL_SYNC=mysql+pymysql://mes_user:mes_secure_password_2024@exam_mysql:3306/mes_platform
+      - MES_BASE_URL=http://10.201.128.80:8000
+      - MES_USERNAME=CNK240400843
+      - MES_PASSWORD=Cc880821/
+      - FACTORY=Auto_THA
+    networks:
+      - exam-system_exam_network
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    restart: unless-stopped
+
+  mes-frontend:
+    image: mes-frontend:latest
+    container_name: mes-frontend
+    ports:
+      - "3004:3004"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://10.201.2.31:8000
+      - PORT=3004
+    networks:
+      - exam-system_exam_network
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    restart: unless-stopped
+
+networks:
+  exam-system_exam_network:
+    external: true

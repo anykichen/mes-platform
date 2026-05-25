@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.egg
+venv/
+.env
+
+# Node
+node_modules/
+.next/
+out/
+
+# Docker
+*.tar
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Temp
+/tmp/
+*.pid
+# Env files
+.env.local
+.env.*.local
+*.html
